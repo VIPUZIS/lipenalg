@@ -19,7 +19,7 @@
         int x = 2 + 2; printf("%d\n", x);
     endcpp
 """
-from .lexer import tokenize, LipeSyntaxError
+from .lexer import tokenize, LipeSyntaxError, Token
 from . import ast_nodes as A
 
 BAT_CMP_MAP = {"EQU": "==", "NEQ": "!=", "LSS": "<", "LEQ": "<=", "GTR": ">", "GEQ": ">="}
@@ -31,6 +31,7 @@ class Parser:
         self.src_lines = source.split("\n")
         self.toks = tokenize(source)
         self.pos = 0
+        self._silent_next = False
 
     # ---------- помощники ----------
     def peek(self, off=0):
@@ -40,6 +41,26 @@ class Parser:
         t = self.toks[self.pos]
         self.pos += 1
         return t
+
+    def insert_token(self, tok):
+        """Вернуть токен обратно в поток (используется для 'endif' внутри echo)."""
+        self.toks.insert(self.pos, tok)
+
+    def split_rawtext_tail(self, tk, word):
+        """Если RAWTEXT заканчивается на '<word>' (endif/else), отщепить его."""
+        txt = tk.value
+        low = txt.lower()
+        idx = -1
+        for marker in (" " + word, "\t" + word):
+            p = low.rfind(marker)
+            if p != -1 and (p + len(marker) == len(low)):
+                idx = p; break
+        if idx == -1:
+            return None
+        head = txt[:idx].rstrip(" \t\r")
+        self.toks[self.pos - 1] = Token("RAWTEXT", head, tk.line, tk.col)
+        self.insert_token(Token("KW", word, tk.line, tk.col + idx))
+        return head
 
     def at_kw(self, *words):
         t = self.peek()
@@ -212,12 +233,8 @@ class Parser:
 
     def parse_statement(self):
         t = self.peek()
-        if t.type == "ECHO_OFF":                      # @echo off — игнорируется
-            self.next()
-            while self.peek().type not in ("NEWLINE", "EOF"):
-                self.next()
-            self.end_stmt()
-            return None
+        if t.type == "KW" and t.value == "echo" and getattr(t, "silent", False):
+            self._silent_next = True                 # @echo — молчаливый вывод
         if t.type == "KW":
             kw = t.value
             if kw == "echo":   return self.parse_echo()
@@ -299,6 +316,8 @@ class Parser:
     def parse_echo(self):
         t = self.next()  # echo
         no_nl = False
+        silent = getattr(self, "_silent_next", False)
+        self._silent_next = False
         if self.peek().type == "OP" and self.peek().value == "/":
             save = self.pos
             self.next()
@@ -312,31 +331,24 @@ class Parser:
             tk = self.peek()
             if tk.type in ("NEWLINE", "EOF", "AMP"):
                 break
-            if tk.type == "KW" and tk.value == "endif":
+            if tk.type == "KW" and tk.value in BLOCK_ENDS:
                 break
             if tk.type == "RAWTEXT":
                 self.next()
-                txt = tk.value
-                # inline-if: текст может заканчиваться на " endif"
-                low = txt.lower()
-                idx = None
-                for marker in (" endif", "\tendif"):
-                    p = low.rfind(marker)
-                    if p != -1 and (p + len(marker) == len(low)):
-                        idx = p; break
-                if idx is not None:
-                    parts.append(A.Str(txt[:idx].rstrip(), tk.line))
-                    # откатываем позицию: возвращаем "endif" как токен — проще: вставляем его обратно в поток
-                    from .lexer import Token
-                    self.toks.insert(self.pos, Token("KW", "endif", tk.line, tk.col + idx))
-                    break
-                parts.append(A.Str(txt, tk.line))
+                # leftover " ... endif/else" в тексте — отщепляем ключевое слово
+                for word in ("endif", "else"):
+                    if self.split_rawtext_tail(tk, word) is not None:
+                        if tk.value.strip():
+                            parts.append(A.Str(tk.value.strip(), tk.line))
+                        break
+                else:
+                    parts.append(A.Str(tk.value, tk.line))
                 continue
             parts.append(self.parse_expr())
         if not parts:
             parts = [A.Str("", t.line)]
         self.end_stmt()
-        return A.Echo(parts, no_newline=no_nl, line=t.line)
+        return A.Echo(parts, no_newline=no_nl, silent=silent, line=t.line)
 
     # set X=..., set /a X=expr, set NAME+==..., set NAME-==...
     def parse_set(self):

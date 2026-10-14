@@ -7,12 +7,14 @@ class Token:
     value: object
     line: int
     col: int
+    silent: bool = False          # @echo — молчаливый вывод (BAT)
 
 KEYWORDS_BAT = {
     "echo", "set", "if", "else", "endif", "goto", "call", "pause",
     "for", "in", "do", "endfor", "exit", "rem", "cls",
 }
 KEYWORDS_PY = {"def", "enddef", "return", "while", "endwhile", "and", "or", "not", "true", "false"}
+ALL_KEYWORDS = KEYWORDS_BAT | KEYWORDS_PY | {"cpp", "endcpp", "elseif", "then", "elif"}
 BUILTIN_NAMES = {"input", "print", "len", "str", "int", "float", "range", "abs", "min", "max", "system"}
 
 OPERATORS3 = ["//=", "**"]
@@ -100,7 +102,7 @@ def tokenize(source: str):
         if ch == "#":
             j = source.find("\n", i)
             i = n if j < 0 else j; continue
-        # --- числа ---
+        # --- числа (в т.ч. с точкой внутри слов: a.txt, 1.5) ---
         if ch.isdigit() or (ch == "." and i + 1 < n and source[i+1].isdigit()):
             j = i
             seen_dot = False
@@ -129,7 +131,12 @@ def tokenize(source: str):
         if ch == "%":
             j = source.find("%", i + 1)
             if j > 0:
-                push("VAR", source[i+1:j])
+                name = source[i+1:j]
+                # это не переменная, если внутри есть пробелы/перенос строки
+                # (например, "echo 50% done" или "echo a % b") — тогда '%' это оператор
+                if not name or any(c in name for c in " \t\r\n\"'"):
+                    push("OP", "%"); i += 1; col += 1; continue
+                push("VAR", name)
                 col += j + 1 - i; i = j + 1; continue
             raise LipeSyntaxError("Незакрытая переменная %...%", line)
         # --- операторы ---
@@ -157,30 +164,124 @@ def tokenize(source: str):
                         j += 1
                     push("ID", source[i:j])
                     col += j - i; i = j; continue
-            elif ch.isalpha() or ch == "!":
+            else:
+                # echo/cmd/title: читаем посимвольно до конца строки, разрезая на
+                # текст (RAWTEXT), переменные %NAME% (VAR) и строки в кавычках (STRING),
+                # чтобы "echo Привет, %NAME%!" или 'echo "50%% done"' парсились как части.
+                buf = []
+
+                def flush_raw():
+                    if buf:
+                        txt = "".join(buf).rstrip(" \t\r")
+                        if txt:
+                            toks.append(Token("RAWTEXT", txt, line, col))
+                        buf.clear()
+
+                def lstrip_buf():
+                    while buf and buf[0] in " \t":
+                        buf.pop(0)
+
+                raw_mode = True          # внутри "echo ..." до конца строки
+
+                def enter_raw():
+                    nonlocal raw_mode
+                    raw_mode = True
+
                 j = i
                 while j < n and source[j] != "\n":
-                    j += 1
-                raw = source[i:j].rstrip(" \t\r")
-                # спец-символы (кавычки, переменные, скобки) — не текст, их парсит parser
-                if raw[:1] not in ("\"", "'", "%", "["):
-                    push("RAWTEXT", raw)
+                    c = source[j]
+                    if not raw_mode:
+                        break            # наткнулись на обычное место кода — выходим
+                    if c == "%":
+                        k = source.find("%", j + 1)
+                        if k > j:
+                            inner = source[j+1:k]
+                            if inner and not any(x in inner for x in " \t\r\n\"'"):
+                                flush_raw()
+                                toks.append(Token("VAR", inner, line, col))
+                                j = k + 1
+                                continue
+                    elif c in "\"'":
+                        flush_raw()
+                        quote = c
+                        q = j + 1; sbuf = []
+                        while q < n and source[q] != quote:
+                            if source[q] == "\\" and q + 1 < n:
+                                nxt = source[q+1]
+                                sbuf.append({"n": "\n", "t": "\t", "\\": "\\"}.get(nxt, nxt))
+                                q += 2
+                            else:
+                                sbuf.append(source[q]); q += 1
+                        if q < n: q += 1
+                        toks.append(Token("STRING", "".join(sbuf), line, col))
+                        j = q
+                        continue
+                    low = source[j:j+8].lower()
+                    if low.startswith("endif") and (j + 5 >= n or not source[j+5].isalnum()) \
+                       and (not buf or buf[-1] in " \t"):
+                        flush_raw()
+                        toks.append(Token("KW", "endif", line, col))
+                        j += 5
+                        raw_mode = False
+                        break
+                    if low.startswith("else") and (j + 4 >= n or not source[j+4].isalnum()) \
+                       and (not buf or buf[-1] in " \t"):
+                        flush_raw()
+                        toks.append(Token("KW", "else", line, col))
+                        j += 4
+                        # после else идёт следующая команда ("else echo текст ... endif")
+                        while j < n and source[j] in " \t":
+                            j += 1
+                        w2 = ""
+                        k2 = j
+                        while k2 < n and (source[k2].isalpha() or source[k2] == "_"):
+                            w2 += source[k2]; k2 += 1
+                        wl = w2.lower()
+                        if wl in ("echo", "cmd", "title"):
+                            toks.append(Token("KW" if wl == "echo" else "ID", wl, line, col))
+                            j = k2
+                            # дальше снова сырой текст до конца строки
+                            while j < n and source[j] in " \t":
+                                j += 1
+                            continue
+                        elif w2:
+                            toks.append(Token("ID", w2, line, col))
+                            j = k2
+                            raw_mode = False   # goto :lbl / set X=... — обычный разбор
+                            break
+                        continue
+                    buf.append(c); j += 1
+                flush_raw()
+                if j > i:
                     col += j - i; i = j; continue
         # --- идентификаторы / ключевые слова (@ — префикс молчаливого echo из BAT) ---
+        silent_echo = False
         if ch == "@":
+            silent_echo = True
             i += 1; col += 1
-            continue
+            if i >= n: continue
+            ch = source[i]
         if ch.isalpha() or ch == "_":
             j = i
             while j < n and (source[j].isalnum() or source[j] == "_"):
                 j += 1
             word = source[i:j]
             low = word.lower()
-            if low == "echo" and i > 0 and source[i-1] == "@":   # @echo off -> выключение эха
-                push("ECHO_OFF", low)
-            elif low == "cpp":
+            if silent_echo and low == "echo":
+                # @echo off — классическая BAT-преамбула, игнорируется целиком
+                rest = source[j:j+6].lower()
+                if (rest.startswith("off") and (j + 3 >= n or not source[j+3].isalnum())):
+                    k = source.find("\n", i)
+                    i = n if k < 0 else k
+                    continue
+                toks.append(Token("KW", "echo", line, col, silent=True))
+                i = j; col += j - i
+                continue
+            if low == "cpp":
                 push("KW", "cpp")
                 CPPMODE = True                      # дальше до endcpp — чистый C++
+            elif low in ALL_KEYWORDS:
+                push("KW", low)
             elif low in BUILTIN_NAMES:
                 push("BUILTIN", low)
             else:
